@@ -201,4 +201,5 @@ scripts/create_val/val.parquet
 data
 temp
 scripts/*
+scripts
 areal
