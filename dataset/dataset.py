@@ -8,6 +8,9 @@ from datasets import concatenate_datasets, load_dataset
 from datasets.distributed import split_dataset_by_node
 from PIL import Image
 from PIL.Image import Image as ImageObject
+import PIL
+
+PIL.Image.MAX_IMAGE_PIXELS = 933120000
 
 from .preprocess import get_preprocess_func
 from .prompt import PROBLEM_TYPE_SPECIAL_PROMPT

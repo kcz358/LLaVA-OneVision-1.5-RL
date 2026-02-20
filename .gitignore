@@ -200,3 +200,5 @@ datascripts/create_val/val.parquet
 scripts/create_val/val.parquet
 data
 temp
+scripts/*
+areal

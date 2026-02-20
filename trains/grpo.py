@@ -141,7 +141,9 @@ def main(args):
         tokenizer=tokenizer,
         processor=processor,
         enable_thinking=False,
-        dump_dir=None,
+        dump_dir=os.path.join(
+            StatsLogger.get_log_path(config.stats_logger), "generated-train"
+        ),
         stat_by_type=True,
     )
     eval_workflow = VisionRLVRWorkflow(
