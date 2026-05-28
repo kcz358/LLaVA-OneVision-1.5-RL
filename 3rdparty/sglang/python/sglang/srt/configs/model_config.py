@@ -729,6 +729,7 @@ multimodal_model_archs = [
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "LLaVAOneVision1_5_ForConditionalGeneration",
+    "LlavaOnevision2ForConditionalGeneration",
 ]
 
 
