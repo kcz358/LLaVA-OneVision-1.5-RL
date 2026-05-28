@@ -703,3 +703,6 @@ def _load_weights_into(model, weights: Iterable[Tuple[str, torch.Tensor]]) -> No
 
 
 LlavaOnevision2ForConditionalGeneration.load_weights = _load_weights_into
+
+
+EntryClass = [LlavaOnevision2ForConditionalGeneration]
