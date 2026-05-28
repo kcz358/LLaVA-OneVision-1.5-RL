@@ -135,6 +135,14 @@ class VisionRLVRWorkflow(BaseVisionRLVRWorkflow):
                 res["multi_modal_input"][0]["image_grid_thw"] = processed_input[
                     "image_grid_thw"
                 ]
+
+            # OV2: pass through per-patch (t, h, w) positions when the
+            # processor produces them (LLaVA-OneVision-2 vision tower
+            # requires patch_positions for 3D RoPE + patch merger).
+            if "patch_positions" in processed_input:
+                res["multi_modal_input"][0]["patch_positions"] = processed_input[
+                    "patch_positions"
+                ]
             results.append(res)
 
         if self.dump_dir is not None:
