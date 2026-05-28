@@ -4,6 +4,12 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from einops import rearrange
+from transformers.activations import ACT2FN
+
+from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils import add_prefix
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -104,3 +110,212 @@ def build_cu_seqlens(
             f"calculated={cu_seqlens[-1]}, grid_thw={grid_thw}"
         )
     return torch.tensor(cu_seqlens, dtype=torch.int32, device=device), max_seqlen
+
+
+def _get_norm(config):
+    """Return LayerNorm or RMSNorm based on `config.layer_norm_type`.
+
+    Raises ValueError on unknown values (defensive — typos like 'rmsnorm'
+    silently fell through to LayerNorm before).
+    """
+    norm_type = getattr(config, "layer_norm_type", "layer_norm")
+    if norm_type == "layer_norm":
+        return nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+    if norm_type == "rms_norm":
+        return nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+    raise ValueError(f"Unknown layer_norm_type: {norm_type!r}")
+
+
+class OneVisionEncoderEmbeddings(nn.Module):
+    """Patch embedding via Conv2d (kernel_size=stride=patch_size, bias=False).
+
+    Mirrors HF ``OneVisionEncoderEmbeddings`` so the checkpoint
+    ``patch_embedding.weight`` loads directly.
+
+    Input  : [N, C, P, P] or [N, C*P*P]
+    Output : [N, hidden_size]
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.image_size = config.image_size
+        self.patch_size = config.patch_size
+        self.in_channels = config.num_channels
+        self.patch_embedding = nn.Conv2d(
+            in_channels=config.num_channels,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+            bias=False,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        target_dtype = self.patch_embedding.weight.dtype
+        hidden_states = hidden_states.view(
+            -1, self.in_channels, self.patch_size, self.patch_size
+        )
+        hidden_states = self.patch_embedding(
+            hidden_states.to(dtype=target_dtype)
+        ).view(-1, self.embed_dim)
+        return hidden_states
+
+
+class LlavaOnevision2VisionPatchMerger(nn.Module):
+    """LayerNorm + 2x Linear (TP-aware), merges spatial_merge_size^2 patches into one token.
+
+    Optionally adds H/W absolute position embeddings (controlled by
+    ``use_patch_position_encoding``).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        context_dim: int,
+        spatial_merge_size: int = 2,
+        layer_norm_eps: float = 1e-5,
+        use_patch_position_encoding: bool = False,
+        patch_position_encoding_type: str = "absolute",
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.hidden_size = context_dim * (spatial_merge_size ** 2)
+        self.spatial_merge_size = spatial_merge_size
+        self.use_patch_position_encoding = use_patch_position_encoding
+        self.ln_q = nn.LayerNorm(context_dim, eps=layer_norm_eps)
+        self.mlp = nn.ModuleList(
+            [
+                ColumnParallelLinear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=add_prefix("mlp.0", prefix),
+                ),
+                nn.GELU(),
+                RowParallelLinear(
+                    self.hidden_size,
+                    dim,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=add_prefix("mlp.2", prefix),
+                ),
+            ]
+        )
+        if use_patch_position_encoding:
+            if patch_position_encoding_type != "absolute":
+                raise ValueError(
+                    f"Unknown patch_position_encoding_type: {patch_position_encoding_type}"
+                )
+            self.pos_emb_h = nn.Embedding(max_position_embeddings, dim)
+            self.pos_emb_w = nn.Embedding(max_position_embeddings, dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        patch_positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if patch_positions is not None and patch_positions.dim() == 3:
+            patch_positions = patch_positions.squeeze(0)
+        x = self.ln_q(x).view(-1, self.hidden_size)
+        fc1, act, fc2 = self.mlp
+        x, _ = fc1(x)
+        x = act(x)
+        x, _ = fc2(x)
+        if self.use_patch_position_encoding and patch_positions is not None:
+            pp = patch_positions.view(-1, self.spatial_merge_size ** 2, 3)[:, 0, :]
+            pp = (pp // self.spatial_merge_size).long()
+            x = x + self.pos_emb_h(pp[:, 1]) + self.pos_emb_w(pp[:, 2])
+        return x
+
+
+class OneVisionEncoderMLP(nn.Module):
+    """Siglip-style MLP via TP linear (ColumnParallel + RowParallel)."""
+
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.fc1 = ColumnParallelLinear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("fc1", prefix),
+        )
+        self.fc2 = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("fc2", prefix),
+        )
+        self.act = ACT2FN[config.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self.fc1(x)
+        x = self.act(x)
+        x, _ = self.fc2(x)
+        return x
+
+
+class OneVisionEncoderBlock(nn.Module):
+    """Pre-norm + VisionAttention + pre-norm + MLP (OV2 vision block).
+
+    Convention (matches OV1.5 ``RiceBlock``): ``x`` carries shape ``[s, b, d]``.
+    Inside, we rearrange to ``[b, s, d]`` for VisionAttention then back.
+
+    ``qkv_backend`` defaults to ``None`` so ``VisionAttention`` auto-selects
+    based on platform (fa3/triton on CUDA Hopper+, sdpa on CPU). Production
+    callers can override.
+    """
+
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        qkv_backend: Optional[str] = None,
+    ):
+        super().__init__()
+        self.layer_norm1 = _get_norm(config)
+        self.layer_norm2 = _get_norm(config)
+        self.attn = VisionAttention(
+            embed_dim=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            projection_size=config.hidden_size,
+            use_qkv_parallel=True,
+            rotary_embed="normal",
+            proj_bias=True,
+            qkv_backend=qkv_backend,
+            flatten_batch=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
+        )
+        self.mlp = OneVisionEncoderMLP(
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        h = self.layer_norm1(x)
+        h = rearrange(h, "s b ... -> b s ...")
+        attn = self.attn(
+            h, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
+        )
+        attn = rearrange(attn, "b s ... -> s b ...")
+        x = x + attn
+        x = x + self.mlp(self.layer_norm2(x))
+        return x
