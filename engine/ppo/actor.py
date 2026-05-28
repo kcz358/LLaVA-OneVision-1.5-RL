@@ -20,6 +20,31 @@ from utils.functional import ppo_actor_loss_fn
 logger = logging.getLogger(__name__)
 
 
+# OV2: transformers v5 stores model._no_split_modules as a ``set``
+# (modeling_utils.py:1370 force-casts in PreTrainedModel.__init__), but
+# AReaL's apply_fsdp2 indexes it as a list (utils/fsdp/__init__.py:70:
+# ``fsdp_transformer_layer_cls_to_wrap[0]``). Patch the entry point in
+# areal.utils.fsdp.parallel (its module-local binding) so the value is
+# always a list before AReaL touches it.
+def _ov2_fsdp2_set_to_list_patch() -> None:
+    import areal.utils.fsdp as _fsdp_pkg
+    import areal.utils.fsdp.parallel as _fsdp_parallel
+    _orig_apply = _fsdp_pkg.apply_fsdp2
+
+    @functools.wraps(_orig_apply)
+    def _wrapped(model, fsdp_kwargs, wrap_policy):
+        nsm = getattr(model, "_no_split_modules", None)
+        if isinstance(nsm, (set, tuple, frozenset)):
+            model._no_split_modules = list(nsm)
+        return _orig_apply(model, fsdp_kwargs, wrap_policy)
+
+    _fsdp_pkg.apply_fsdp2 = _wrapped
+    _fsdp_parallel.apply_fsdp2 = _wrapped
+
+
+_ov2_fsdp2_set_to_list_patch()
+
+
 class PPOActor(BasePPOActor):
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         super().__init__(config, engine)
