@@ -18,6 +18,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 
@@ -631,3 +632,74 @@ class LlavaOnevision2ForConditionalGeneration(nn.Module):
                 input_ids, hidden_states, self.lm_head, forward_batch,
             )
         return self.pooler(hidden_states, forward_batch)
+
+
+def map_hf_name(name: str) -> str:
+    """Translate HF OV2 checkpoint key to sglang param key.
+
+    Vision: model.visual.X -> visual.X; self_attn.qkv -> attn.qkv_proj;
+            self_attn.proj -> attn.proj.
+    Text:   model.language_model.X -> model.X.
+    """
+    if name.startswith("model.visual"):
+        name = name[len("model.") :]
+        name = name.replace(".self_attn.qkv.", ".attn.qkv_proj.")
+        name = name.replace(".self_attn.proj.", ".attn.proj.")
+    elif name.startswith("model.language_model"):
+        name = "model." + name[len("model.language_model.") :]
+    return name
+
+
+def _load_weights_into(model, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+    """Stream HF OV2 safetensors weights into the sglang model.
+
+    Text branch uses standard q/k/v -> qkv_proj and gate/up -> gate_up_proj
+    stacked-param merging via the bound weight_loader. Vision branch uses
+    default_weight_loader because VisionAttention.qkv_proj is already a single
+    ColumnParallelLinear (no shard merging).
+    """
+    stacked_params_mapping = [
+        (".qkv_proj", ".q_proj", "q"),
+        (".qkv_proj", ".k_proj", "k"),
+        (".qkv_proj", ".v_proj", "v"),
+        (".gate_up_proj", ".gate_proj", 0),
+        (".gate_up_proj", ".up_proj", 1),
+    ]
+    params_dict = dict(model.named_parameters(remove_duplicate=False))
+
+    for raw_name, loaded_weight in weights:
+        if "rotary_emb.inv_freq" in raw_name:
+            continue
+
+        name = map_hf_name(raw_name)
+
+        matched = False
+        if "visual" not in name:
+            for tgt, src, shard_id in stacked_params_mapping:
+                if src in name:
+                    pname = name.replace(src, tgt)
+                    if pname.endswith(".bias") and pname not in params_dict:
+                        matched = True
+                        break
+                    if pname not in params_dict:
+                        # not a real stacked merge target; fall through
+                        break
+                    param = params_dict[pname]
+                    param.weight_loader(param, loaded_weight, shard_id)
+                    matched = True
+                    break
+        if matched:
+            continue
+
+        if name.endswith(".bias") and name not in params_dict:
+            continue
+        if name not in params_dict:
+            raise KeyError(
+                f"OV2 weight key not in model params: raw={raw_name!r}, mapped={name!r}"
+            )
+        param = params_dict[name]
+        loader = getattr(param, "weight_loader", default_weight_loader)
+        loader(param, loaded_weight)
+
+
+LlavaOnevision2ForConditionalGeneration.load_weights = _load_weights_into
