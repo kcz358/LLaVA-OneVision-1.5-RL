@@ -147,6 +147,32 @@ python3 -m areal.launcher.local trains/grpo.py --config configs/llavaov15-8b_sta
 python3 -m areal.launcher.local trains/grpo.py --config configs/llavaov15-8b_stage2_grpo.yaml
 ```
 
+### LLaVA-OneVision-2 (8B) — sglang inference
+
+This repo's `3rdparty/sglang` has been extended to support `LlavaOnevision2ForConditionalGeneration`.
+After the standard `install.sh`, run `install_ov2.sh` to upgrade transformers to the version
+the OV2 checkpoint targets (5.7.0).
+
+```bash
+# 1. Standard env (see Quick Start above)
+bash install.sh
+
+# 2. Additional OV2 step: upgrade transformers (also pulls huggingface_hub>=1.0, tokenizers>=0.22, numpy>=2)
+bash install_ov2.sh
+
+# 3. Launch sglang server (TP=1; supports --tp 2 / --tp 4 if you have the GPUs)
+python -m sglang.launch_server \
+    --model-path /path/to/LLaVA-OneVision-2-8B-Instruct \
+    --trust-remote-code \
+    --dtype bfloat16 \
+    --tp 1 \
+    --mem-fraction-static 0.6
+```
+
+GRPO end-to-end training for OV2 (workflow adapter for `patch_positions`,
+training config, etc.) is not yet in scope for this milestone — only sglang
+inference is wired up.
+
 ## Contributors
 Thanks so much to all of our amazing contributors!
 
