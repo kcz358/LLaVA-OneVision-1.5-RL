@@ -8,7 +8,17 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 
 
@@ -469,3 +479,155 @@ class OneVisionEncoderTransformer(nn.Module):
         # 4. Merger: [1, N, D] -> [N, D] -> [N/merge^2, out_hidden_size]
         h = h.squeeze(0)
         return self.merger(h, patch_positions=patch_positions)
+
+
+class LlavaOnevision2ForConditionalGeneration(nn.Module):
+    """sglang inference module for LLaVA-OneVision-2.
+
+    Top-level layout (flat, not HF's two-level ``model.visual`` / ``model.language_model``):
+        self.visual    : OneVisionEncoderTransformer
+        self.model     : Qwen3Model (text)
+        self.lm_head   : ParallelLMHead (TP-aware logits)
+
+    Checkpoint keys ``model.visual.*`` / ``model.language_model.*`` / ``lm_head.*``
+    are remapped to this layout by ``load_weights`` (Task 8).
+
+    Multimodal forward goes through sglang's ``general_mm_embed_routine``:
+    text token embeddings are obtained from ``self.model.embed_tokens``,
+    image patches are encoded by ``self.visual.forward`` and spliced in at the
+    image-token positions.
+    """
+
+    # BitsAndBytes scaffolding (matches OV1.5; harmless if BnB unused)
+    default_bitsandbytes_target_modules = [
+        ".fc2.", ".fc1.", ".q_proj.", ".k_proj.", ".v_proj.", ".o_proj.",
+    ]
+    bitsandbytes_stacked_params_mapping = {
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.config = config
+
+        self.visual = OneVisionEncoderTransformer(
+            config.vision_config,
+            quant_config=quant_config,
+            prefix=add_prefix("visual", prefix),
+        )
+        self.model = Qwen3Model(
+            config.text_config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+        self.lm_head = ParallelLMHead(
+            config.text_config.vocab_size,
+            config.text_config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+        )
+        if getattr(config, "tie_word_embeddings", False):
+            import logging
+            logging.warning("tied word embeddings is not supported in LLaVA-OneVision-2.")
+
+        # mrope is enabled when the text config has ``rope_scaling`` with ``mrope_section``
+        text_rope = getattr(config.text_config, "rope_scaling", None)
+        self.is_mrope_enabled = (
+            text_rope is not None and "mrope_section" in text_rope
+        )
+
+        self.logits_processor = LogitsProcessor(config.text_config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+    # ---- multimodal padding pattern ----
+
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+            input_ids, mm_inputs,
+        )
+
+    # ---- vision feature path (image-only; video aliases) ----
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Concatenate per-item ``feature`` (pixel patches), ``image_grid_thw``,
+        and ``patch_positions`` (carried in ``model_specific_data`` by the
+        OV2 multimodal processor, Task 10) and run the vision tower.
+
+        Note: ``item.patch_positions`` is accessed via
+        ``MultimodalDataItem.__getattr__``, which looks up
+        ``model_specific_data["patch_positions"]`` — so the docstring's
+        "model_specific_data" reference and the attribute access in code
+        are consistent.
+        """
+        # Precondition: OV2 multimodal processor (Task 10) must attach `patch_positions`
+        # to each MultimodalDataItem via model_specific_data. Accessed as item.patch_positions
+        # via MultimodalDataItem.__getattr__.
+        for it in items:
+            if "patch_positions" not in it.model_specific_data:
+                raise RuntimeError(
+                    "OV2 vision tower requires `patch_positions` per multimodal item; "
+                    "ensure the OV2 multimodal processor populates it (Task 10)."
+                )
+        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
+            self.visual.dtype,
+        )
+        image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0)
+        patch_positions = torch.cat([item.patch_positions for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        return self.visual(
+            pixel_values,
+            grid_thw=image_grid_thw,
+            patch_positions=patch_positions,
+        )
+
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # OV2 processor folds video frames into the image path; alias.
+        return self.get_image_feature(items)
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    # ---- sglang forward protocol ----
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+    ):
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        if not (
+            forward_batch.forward_mode.is_decode()
+            or not forward_batch.contains_image_inputs()
+        ):
+            if self.is_mrope_enabled:
+                assert positions.ndim == 2 and positions.size(0) == 3, (
+                    "multimodal section rotary embedding requires "
+                    f"(3, seq_len) positions, but got {positions.size()}"
+                )
+
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            language_model=self.model,
+            multimodal_model=self,
+            positions=positions,
+        )
+        if not get_embedding:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch,
+            )
+        return self.pooler(hidden_states, forward_batch)
