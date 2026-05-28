@@ -309,13 +309,163 @@ class OneVisionEncoderBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         h = self.layer_norm1(x)
         h = rearrange(h, "s b ... -> b s ...")
+        # NOTE: VisionAttention.forward accepts **kwargs; max_seqlen is forwarded
+        # for FA varlen backends that can consume it (current backends recompute
+        # it from cu_seqlens, so this is a forward-compatible pass-through).
         attn = self.attn(
             h, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
+            max_seqlen=max_seqlen,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
         x = x + self.mlp(self.layer_norm2(x))
         return x
+
+
+class OneVisionEncoderEncoder(nn.Module):
+    """Thin wrapper: holds the list of OneVisionEncoderBlock layers.
+
+    Mirrors HF ``OneVisionEncoderEncoder.layers`` so checkpoint weights at
+    ``encoder.layers.{i}.*`` load directly into our sglang port.
+    """
+
+    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = "", qkv_backend: Optional[str] = None):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            OneVisionEncoderBlock(
+                config, quant_config=quant_config,
+                prefix=add_prefix(f"layers.{i}", prefix),
+                qkv_backend=qkv_backend,
+            )
+            for i in range(config.num_hidden_layers)
+        ])
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        max_seqlen: Optional[int] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                max_seqlen=max_seqlen,
+            )
+        return hidden_states
+
+
+class OneVisionEncoderTransformer(nn.Module):
+    """Top-level OV2 vision tower.
+
+    Mirrors HF ``LlavaOnevision2VisionPretrainedModel`` so the checkpoint
+    state_dict (``embeddings.patch_embedding.weight``, ``layernorm_pre.*``,
+    ``encoder.layers.{i}.*``, ``merger.*``) loads directly.
+
+    Pipeline:
+        embeddings -> layernorm_pre -> encoder(window-attn) -> [optional layernorm_post]
+        -> merger(spatial_merge_size^2 -> 1)
+
+    Input:
+        pixel_values:    [N, C, P, P]  (or flattened [N, C*P*P])
+        grid_thw:        [num_samples, 3]  rows of [t, h, w]
+        patch_positions: [N, 3]  rows of [t, h, w] per patch
+
+    Output:
+        merged tokens: [N // spatial_merge_size**2, out_hidden_size]
+    """
+
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        qkv_backend: Optional[str] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.spatial_merge_size = config.spatial_merge_size
+        self.frame_windows_size = getattr(config, "frame_windows_size", 4)
+
+        self.embeddings = OneVisionEncoderEmbeddings(config)
+        self.layernorm_pre = _get_norm(config)
+        self.video_rope = VisionRotaryEmbedding(config)
+
+        self.encoder = OneVisionEncoderEncoder(
+            config, quant_config=quant_config,
+            prefix=add_prefix("encoder", prefix),
+            qkv_backend=qkv_backend,
+        )
+
+        if getattr(config, "use_head", False):
+            self.layernorm_post = _get_norm(config)
+        else:
+            self.layernorm_post = None
+
+        self.merger = LlavaOnevision2VisionPatchMerger(
+            dim=config.out_hidden_size,
+            context_dim=config.hidden_size,
+            spatial_merge_size=config.spatial_merge_size,
+            layer_norm_eps=config.layer_norm_eps,
+            use_patch_position_encoding=getattr(config, "use_patch_position_encoding", False),
+            patch_position_encoding_type=getattr(config, "patch_position_encoding_type", "absolute"),
+            max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
+            quant_config=quant_config,
+            prefix=add_prefix("merger", prefix),
+        )
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        patch_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        # 1. Embeddings: [N, C, P, P] -> [N, D] -> [1, N, D]
+        h = self.embeddings(pixel_values)
+        if h.dim() == 2:
+            h = h.unsqueeze(0)
+
+        # 2. 3D RoPE freqs from patch_positions
+        if patch_positions.dim() == 3:
+            patch_positions = patch_positions.squeeze(0)
+        freqs = self.video_rope.forward_from_positions(patch_positions)  # [N, half]
+        freqs = torch.cat([freqs, freqs], dim=-1)                         # [N, head_dim]
+        cos = freqs.cos().to(h.dtype)
+        sin = freqs.sin().to(h.dtype)
+
+        # 3. Pre-norm + encoder (window attn per cu_seqlens)
+        h = self.layernorm_pre(h)
+        cu_seqlens, max_seqlen = build_cu_seqlens(
+            grid_thw=grid_thw,
+            total_patches=h.shape[1],
+            fixed_t=self.frame_windows_size,
+            device=h.device,
+        )
+
+        # Block convention: [s, b, d]
+        h = rearrange(h, "b s d -> s b d")
+        h = self.encoder(
+            h,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=(cos, sin),
+            max_seqlen=max_seqlen,
+        )
+        h = rearrange(h, "s b d -> b s d")
+
+        if self.layernorm_post is not None:
+            h = self.layernorm_post(h)
+
+        # 4. Merger: [1, N, D] -> [N, D] -> [N/merge^2, out_hidden_size]
+        h = h.squeeze(0)
+        return self.merger(h, patch_positions=patch_positions)
