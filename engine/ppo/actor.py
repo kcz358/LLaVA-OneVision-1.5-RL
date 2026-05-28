@@ -156,6 +156,32 @@ class FSDPPPOActor(FSDPEngine):
         super().__init__(config)
         self.actor = PPOActor(config, self)
 
+    def prepare_mb_list(self, input_):
+        """Extend the base implementation to also cat OV2's per-patch
+        (t, h, w) positions across the multimodal items in each microbatch.
+
+        BaseHFEngine.prepare_mb_list already handles pixel_values /
+        image_grid_thw / video_grid_thw. OV2's vision tower additionally
+        needs ``patch_positions`` (LlavaOnevision2ForConditionalGeneration's
+        ``get_image_features`` consumes it). Both args are forwarded to
+        model.forward via ``**padded_mb_input``.
+        """
+        mb_list = super().prepare_mb_list(input_)
+        assert mb_list.padded_mbs is not None
+        for mb, padded_mb in zip(mb_list.mbs, mb_list.padded_mbs):
+            if "multi_modal_input" not in mb:
+                continue
+            patch_positions_list = [
+                item["patch_positions"]
+                for item in mb["multi_modal_input"]
+                if "patch_positions" in item
+            ]
+            if patch_positions_list:
+                cat = torch.cat(patch_positions_list, dim=0)
+                mb["patch_positions"] = cat
+                padded_mb["patch_positions"] = cat
+        return mb_list
+
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> torch.Tensor | None:
         return self.actor.compute_logp(*args, **kwargs)
