@@ -34,7 +34,13 @@ from dataset.dataset import get_dataset
 from dataset.filtered_dataloader import FilteredStatefulDataLoader
 from engine.ppo.actor import FSDPPPOActor
 from reward.reward_system import RewardSystem
+from utils.patches import apply_ov2_processor_save_patch
 from workflow.vision_rlvr_with_qid import VisionRLVRWorkflowWithQid
+
+# Patch AReaL's FSDP HF saver so custom processors loaded via trust_remote_code
+# (e.g. OV2's LlavaOnevision2Processor, which doesn't inherit ProcessorMixin)
+# don't crash the saver at saver.freq_steps. See utils/patches.py.
+apply_ov2_processor_save_patch()
 
 
 def main(args):

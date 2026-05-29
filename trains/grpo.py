@@ -33,7 +33,13 @@ from api.cli_args import GRPOConfig
 from dataset.dataset import get_dataset
 from engine.ppo.actor import FSDPPPOActor
 from reward.reward_system import RewardSystem
+from utils.patches import apply_ov2_processor_save_patch
 from workflow.vision_rlvr import VisionRLVRWorkflow
+
+# Patch AReaL's FSDP HF saver so custom processors loaded via trust_remote_code
+# (e.g. OV2's LlavaOnevision2Processor, which doesn't inherit ProcessorMixin)
+# don't crash the saver at saver.freq_steps. See utils/patches.py.
+apply_ov2_processor_save_patch()
 
 
 def main(args):
