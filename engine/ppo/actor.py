@@ -20,6 +20,31 @@ from utils.functional import ppo_actor_loss_fn
 logger = logging.getLogger(__name__)
 
 
+# OV2: transformers v5 stores model._no_split_modules as a ``set``
+# (modeling_utils.py:1370 force-casts in PreTrainedModel.__init__), but
+# AReaL's apply_fsdp2 indexes it as a list (utils/fsdp/__init__.py:70:
+# ``fsdp_transformer_layer_cls_to_wrap[0]``). Patch the entry point in
+# areal.utils.fsdp.parallel (its module-local binding) so the value is
+# always a list before AReaL touches it.
+def _ov2_fsdp2_set_to_list_patch() -> None:
+    import areal.utils.fsdp as _fsdp_pkg
+    import areal.utils.fsdp.parallel as _fsdp_parallel
+    _orig_apply = _fsdp_pkg.apply_fsdp2
+
+    @functools.wraps(_orig_apply)
+    def _wrapped(model, fsdp_kwargs, wrap_policy):
+        nsm = getattr(model, "_no_split_modules", None)
+        if isinstance(nsm, (set, tuple, frozenset)):
+            model._no_split_modules = list(nsm)
+        return _orig_apply(model, fsdp_kwargs, wrap_policy)
+
+    _fsdp_pkg.apply_fsdp2 = _wrapped
+    _fsdp_parallel.apply_fsdp2 = _wrapped
+
+
+_ov2_fsdp2_set_to_list_patch()
+
+
 class PPOActor(BasePPOActor):
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         super().__init__(config, engine)
@@ -155,6 +180,32 @@ class FSDPPPOActor(FSDPEngine):
     def __init__(self, config: PPOActorConfig):
         super().__init__(config)
         self.actor = PPOActor(config, self)
+
+    def prepare_mb_list(self, input_):
+        """Extend the base implementation to also cat OV2's per-patch
+        (t, h, w) positions across the multimodal items in each microbatch.
+
+        BaseHFEngine.prepare_mb_list already handles pixel_values /
+        image_grid_thw / video_grid_thw. OV2's vision tower additionally
+        needs ``patch_positions`` (LlavaOnevision2ForConditionalGeneration's
+        ``get_image_features`` consumes it). Both args are forwarded to
+        model.forward via ``**padded_mb_input``.
+        """
+        mb_list = super().prepare_mb_list(input_)
+        assert mb_list.padded_mbs is not None
+        for mb, padded_mb in zip(mb_list.mbs, mb_list.padded_mbs):
+            if "multi_modal_input" not in mb:
+                continue
+            patch_positions_list = [
+                item["patch_positions"]
+                for item in mb["multi_modal_input"]
+                if "patch_positions" in item
+            ]
+            if patch_positions_list:
+                cat = torch.cat(patch_positions_list, dim=0)
+                mb["patch_positions"] = cat
+                padded_mb["patch_positions"] = cat
+        return mb_list
 
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> torch.Tensor | None:
