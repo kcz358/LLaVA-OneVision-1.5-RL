@@ -61,13 +61,57 @@ class VisionRotaryEmbedding(nn.Module):
         )
 
     def forward_from_positions(self, patch_positions: torch.Tensor) -> torch.Tensor:
-        """patch_positions: [L, 3] long -> freqs: [L, half] float32."""
+        """patch_positions: [L, 3] long -> freqs: [L, half] float32.
+
+        Force fp32 on inv_freq buffers: a module ``.to(bfloat16)`` (the standard
+        sglang load path) would downcast these non-persistent buffers and
+        truncate high-frequency entries. HF keeps inv_freq in fp32, so we mirror
+        that here regardless of the load dtype.
+        """
         pp = patch_positions.to(self.inv_freq_t.device)
         t, h, w = pp[:, 0].float(), pp[:, 1].float(), pp[:, 2].float()
-        freqs_t = t.unsqueeze(-1) * self.inv_freq_t.unsqueeze(0)  # [L, t_size]
-        freqs_h = h.unsqueeze(-1) * self.inv_freq_h.unsqueeze(0)
-        freqs_w = w.unsqueeze(-1) * self.inv_freq_w.unsqueeze(0)
+        freqs_t = t.unsqueeze(-1) * self.inv_freq_t.float().unsqueeze(0)  # [L, t_size]
+        freqs_h = h.unsqueeze(-1) * self.inv_freq_h.float().unsqueeze(0)
+        freqs_w = w.unsqueeze(-1) * self.inv_freq_w.float().unsqueeze(0)
         return torch.cat([freqs_t, freqs_h, freqs_w], dim=-1)  # [L, half]
+
+
+def _ov2_rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
+    """HF OV2 interleaved rotate_half: (x0, x1, x2, x3, ...) -> (-x1, x0, -x3, x2, ...).
+
+    sglang's default ``apply_rotary_pos_emb`` uses the half-split convention
+    ``cat(-x[..., half:], x[..., :half])`` which pairs RoPE dimensions
+    differently from HF OV2 (which interleaves adjacent dim pairs). The two are
+    NOT numerically equivalent — using sglang's default here gives the wrong
+    vision tower output (see HF ``modeling_llava_onevision2.py::rotate_half``).
+    """
+    return torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(-2)
+
+
+def _ov2_apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    x_shape: Tuple[int, ...],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Customised position embedding applier for OV2's VisionAttention.
+
+    Computes the rotation in fp32 (matching HF) and casts back to the input
+    dtype, using the interleaved ``rotate_half`` convention from HF OV2.
+    Signature follows ``VisionAttention.customized_position_embedding_applier``.
+    """
+    cos, sin = position_embeddings
+    oqd, okd = q.dtype, k.dtype
+    qf = q.float()
+    kf = k.float()
+    cos = cos.float()
+    sin = sin.float()
+    while cos.dim() < qf.dim():
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+    qe = (qf * cos) + (_ov2_rotate_half_interleaved(qf) * sin)
+    ke = (kf * cos) + (_ov2_rotate_half_interleaved(kf) * sin)
+    return qe.to(oqd), ke.to(okd)
 
 
 def build_cu_seqlens(
@@ -308,6 +352,7 @@ class OneVisionEncoderBlock(nn.Module):
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            customized_position_embedding_applier=_ov2_apply_rotary_pos_emb,
         )
         self.mlp = OneVisionEncoderMLP(
             config,
